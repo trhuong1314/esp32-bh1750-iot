@@ -1,3 +1,0 @@
-CompileFlags:
-  CompilationDatabase: D:\esp32\BH1750\build
-  Remove: [-m*, -f*]
