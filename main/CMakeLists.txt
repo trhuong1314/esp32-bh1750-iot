@@ -8,8 +8,6 @@ idf_component_register(
         esp_netif
         lwip
         driver
-        hal
-        esp_driver_i2c
         esp_http_client
-        cjson
+        json
 )

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "esp_mac.h"
 #include "time.h"
 #include "esp_err.h"
 #include "esp_event_base.h"
@@ -31,7 +32,8 @@
 static const char *TAG = "MAIN";
 
 // Cấu hình sever
-#define SERVER_URL "http://....."
+#define SERVER_URL_NEW_DEVCIE "https://iot-light-monitoring.onrender.com/api/devices"
+#define SERVER_URL_NEW_SENSOR_DATA "https://iot-light-monitoring.onrender.com/api/light-levels"
 
 // Cấu hình gửi dữ liệu
 #define chu_ki_gui 30000		// gửi mỗi 30 giây
@@ -68,6 +70,13 @@ static i2c_master_bus_handle_t bus_handle = NULL;
 static bh1750_handle_t *bh1750_handle = NULL;
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
+
+// Cấu trúc chung cho HTTP POST
+typedef struct {
+	const char *urrl;
+	const char *payload;
+	int time_outs;
+} http_post_config_t;
 
 // Hàm khởi tạo nút boot
 void init_boot_button(){
@@ -225,9 +234,65 @@ static void print_mode_name(bh1750_command_t mode) {
     }
 }
 
-// Hàm gửi dữ liệu lên sever
-static esp_err_t send_data_to_server(float lux){
+// Hàm lấy địa chỉ MAC của ESP32
+static void get_device_id(char *out_buffer, size_t buffer_size){
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(out_buffer, buffer_size, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// Hàm HTTP POST
+static esp_err_t http_post(const http_post_config_t *cfg){
 	esp_err_t ret;
+
+	// Cấu hình HTTP client
+	esp_http_client_config_t http_cfg = {
+		.url = cfg->urrl,
+		.method = HTTP_METHOD_POST,		
+		.timeout_ms = cfg->time_outs,
+		.keep_alive_enable = true,
+		.cert_pem = NULL,
+		.use_global_ca_store = false,
+		.buffer_size = 4096,
+	};
+
+	// Khởi tạo HTTP client
+	esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+	if (client == NULL){
+		ESP_LOGE(TAG, "Không thể khởi tạo HTTP");
+		return ESP_FAIL;
+	}
+
+	// thêm header cho request và đặt dữ liệu body cho request
+	esp_http_client_set_header(client, "Content-Type", "application/json");
+	esp_http_client_set_post_field(client, cfg->payload, strlen(cfg->payload));
+
+	// gửi request
+	ret = esp_http_client_perform(client);
+	if (ret == ESP_OK){
+		int status_code = esp_http_client_get_status_code(client);
+		ESP_LOGI(TAG, "HTTP status: %d", status_code);
+		if (status_code == 200 || status_code == 201){
+			ESP_LOGI(TAG, "Thành công");
+		} else {
+			ESP_LOGW(TAG, "sever trả về status: %d", status_code);
+			ret = ESP_FAIL;
+		}
+	} else {
+		ESP_LOGE(TAG, "HTTP resquest thất bại: %s", esp_err_to_name(ret));
+	}
+
+	// dọn dẹp
+	esp_http_client_cleanup(client);
+	return  ret;
+}
+
+// Hàm đăng ký thiết bị với sever
+static esp_err_t register_device (void){
+
+    // lấy device_id
+    char device_id[18];
+    get_device_id(device_id, sizeof(device_id));
 
 	// Tạo 1 JSON object
 	cJSON *root = cJSON_CreateObject();
@@ -237,9 +302,10 @@ static esp_err_t send_data_to_server(float lux){
 	}
 
 	// Thêm các trường dữ liệu
-	cJSON_AddStringToObject(root, "device", "esp32");
-	cJSON_AddNumberToObject(root, "lux", lux);
-	cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+	cJSON_AddStringToObject(root, "id", device_id);
+	cJSON_AddStringToObject(root, "name", "ESP32_BH1750");
+	cJSON_AddStringToObject(root, "location", "Phong_Lab");
+	cJSON_AddNumberToObject(root, "measurement_interval", chu_ki_gui / 1000);
 
 	// Chuyển đổi thành chuỗi
 	char *json_str = cJSON_Print(root);
@@ -251,48 +317,61 @@ static esp_err_t send_data_to_server(float lux){
 		return ESP_FAIL;
 	}
 
-	ESP_LOGI(TAG, "Gửi dữ liệu: %s", json_str);
+	ESP_LOGI(TAG, "Đăng ký thiết bị: %s", json_str);
 
-	// Cấu hình HTTP client
-	esp_http_client_config_t config = {
-		.url = SERVER_URL,
-		.method = HTTP_METHOD_POST,
-		.timeout_ms = 10000,
-		.keep_alive_enable = true,
+	// cấu hình http post
+	http_post_config_t cfg = {
+		.urrl = SERVER_URL_NEW_DEVCIE,
+		.payload = json_str,
+		.time_outs = 30000,
 	};
 
-	// Khởi tạo HTTP Client
-	esp_http_client_handle_t client = esp_http_client_init(&config);
-	if (client == NULL){
-		ESP_LOGE(TAG, "không thể khởi tạo client HTTP");
-		free(json_str);
+	// gửi dữ liệu
+	esp_err_t ret = http_post(&cfg);
+	free(json_str);
+	return ret;
+}
+
+// Hàm gửi dữ liệu lên sever 
+static esp_err_t send_data_to_server (float lux) {
+
+	// lấy địa chỉ MAC
+	char device_id[18];
+	get_device_id(device_id, sizeof(device_id));
+
+	// Tạo JSON object
+	cJSON *root = cJSON_CreateObject();
+	if (root == NULL){
+		ESP_LOGE(TAG, "Không thể tạo JSON object");
 		return ESP_FAIL;
 	}
 
-	// thêm header cho request và đặt dữ liệu body cho resquest
-	esp_http_client_set_header(client, "Content-Type", "application/json");
-	esp_http_client_set_post_field(client, json_str, strlen(json_str));
+	// Thêm các trường
+	cJSON_AddStringToObject(root, "device_id", device_id);
+	cJSON_AddNumberToObject(root, "value", (int)lux);
 
-	// gửi dữ liệu lên sever
-	ret = esp_http_client_perform(client);
-	if (ret == ESP_OK){
-		int status_code = esp_http_client_get_status_code(client);
-		ESP_LOGI(TAG, "HTTP status: %d", status_code);
-		if (status_code == 200 || status_code == 201){
-			ESP_LOGI(TAG, "Gửi dữ liệu lên sever thành công");
-		} else{
-			ESP_LOGW(TAG, "Sever trả về status: %d", status_code);
-		}
-	} else{
-		ESP_LOGE(TAG, "Gửi thất bại: %s", esp_err_to_name(ret));
+	// Chuyển đổi thành chuỗi
+	char *json_str = cJSON_Print(root);
+	cJSON_Delete(root);
+
+	if (json_str == NULL){
+		ESP_LOGE(TAG, "Không thể chuyển thành chuỗi JSON");
+		return ESP_FAIL;
 	}
 
-	// dọn dẹp
-	esp_http_client_cleanup(client);
-	free(json_str);
-	return ret;	
-}
+	ESP_LOGI(TAG, "Gửi dữ liệu: %s", json_str);
 
+	// cấu hình http post
+	http_post_config_t cfg = {
+		.urrl = SERVER_URL_NEW_SENSOR_DATA,
+		.payload = json_str,
+		.time_outs = 30000,
+	};
+
+	esp_err_t ret = http_post(&cfg);
+	free(json_str);
+	return ret;
+}
 // Task đọc lux
 static void task_read_lux(void *arg){
 	float lux;
@@ -301,9 +380,19 @@ static void task_read_lux(void *arg){
 	int state_boot_latest = 1; 	// trạng thái lần cuối của boot để là 1 (không nhấn) vì pull-up
 	TickType_t last_send_time = 0; 		// biến theo dõi lần gửi cuối
 	esp_err_t ret;
-
+	int registered = 0;				// biến đăng ký với 0 là chưa còn 1 là rồi
 	
 	while(1){
+		// Đăng ký thiết bị 1 lần duy nhất khi có WIFI
+		if (!registered) {
+			EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+			if (bits &WIFI_CONNECTED_BIT){
+				ESP_LOGI(TAG, "Đang đăng ký thiết bị...");
+				register_device();
+				registered = 1;
+				vTaskDelay(pdMS_TO_TICKS(1000));
+			}
+		}
 		ret = read_lux(bh1750_handle, &lux);
 		if (ret == ESP_OK){
 			ESP_LOGI(TAG, "[%d] Light: %.2f lux", ++count, lux);
@@ -328,7 +417,7 @@ static void task_read_lux(void *arg){
 		
 		// Nếu nút vừa được nhấn
 		if (current_state == 0 && state_boot_latest == 1){
-			ESP_LOGI("Nút boot đã được nhấn");
+			ESP_LOGI(TAG,"Nút boot đã được nhấn");
 		}
 		// cập nhật trạng thái
 		state_boot_latest = current_state;
